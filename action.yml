@@ -11,6 +11,10 @@ inputs:
     description: Filter to be used. 'auto-merge' | 'always'
     required: false
     default: 'auto-merge'
+  max_mergeable_rebases:
+    description: "TODO: copy from Mac"
+    required: false
+    default: '0'
 runs:
   using: 'node16'
   main: 'dist/index.js'
