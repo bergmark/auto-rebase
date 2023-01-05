@@ -17,33 +17,50 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 const core_1 = __nccwpck_require__(2186);
-const github_1 = __nccwpck_require__(5438);
+// Use the following if debugging and comment out the `import` line
+const context = JSON.parse((0, core_1.getInput)('context'));
+// import { context } from "@actions/github";
 const rest_1 = __nccwpck_require__(5375);
 const { rebasePullRequest } = __nccwpck_require__(8152);
 const token = (0, core_1.getInput)('github_token');
 const filter = (0, core_1.getInput)('filter');
+// TODO: better error on failed parse
+const max_mergeable_rebases = parseInt((0, core_1.getInput)('max_mergeable_rebases'));
 if (!['always', 'auto-merge'].includes(filter)) {
     (0, core_1.setFailed)("Illegal filter used");
 }
 const octokit = new rest_1.Octokit({ auth: token });
-const owner = github_1.context.repo.owner;
-const repo = github_1.context.repo.repo;
-const base = github_1.context.ref;
+const owner = context.repo.owner;
+const repo = context.repo.repo;
+const base = context.ref;
 console.log(`Owner: ${owner}`);
 console.log(`Repository: ${repo}`);
 console.log(`Current branch: ${base}`);
 try {
-    run(octokit, owner, repo, base);
+    // Use the following if debugging and comment out the `run` line
+    prsToRebase(octokit, owner, repo, base).then(console.log).catch(console.error);
+    // run(octokit, owner, repo, base);
 }
 catch (error) {
     (0, core_1.setFailed)(error.message);
 }
-function run(octokit, owner, repo, base) {
+function searchRequestQuery(owner, repo) {
+    return `repo:${owner}/${repo} is:pr is:open -review:changes_requested review:approved status:success draft:false`;
+}
+function getApprovedPassingPrs(octokit, owner, repo) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const raw_query = searchRequestQuery(owner, repo);
+        console.log({ raw_query });
+        const pulls = yield octokit.paginate("GET /search/issues", { q: raw_query });
+        return pulls;
+    });
+}
+function getPrs(octokit, owner, repo, base) {
     return __awaiter(this, void 0, void 0, function* () {
         const pulls = yield octokit.paginate("GET /repos/{owner}/{repo}/pulls", {
-            owner: owner,
-            repo: repo,
-            base: base
+            owner,
+            repo,
+            base,
         }, res => res.data);
         let pullsToRebase;
         if (filter === 'auto-merge') {
@@ -55,7 +72,85 @@ function run(octokit, owner, repo, base) {
         else {
             pullsToRebase = pulls;
         }
-        yield Promise.all(pullsToRebase.map((pull) => __awaiter(this, void 0, void 0, function* () {
+        return pullsToRebase;
+    });
+}
+function groupByNumber(prs) {
+    let prsByNumber = {};
+    for (const pr of prs) {
+        let num = pr.number;
+        prsByNumber[num] = pr;
+    }
+    return prsByNumber;
+}
+function combineAndCategorize(prsFromSearch, prsFromGet) {
+    var _a;
+    let searchByNumber = groupByNumber(prsFromSearch);
+    let getByNumber = groupByNumber(prsFromGet);
+    let prsByBase = {};
+    for (const [number, pr] of Object.entries(getByNumber)) {
+        prsByBase[_a = pr.base.ref] || (prsByBase[_a] = {
+            latent: {},
+            imminent: {},
+        });
+        if (pr.auto_merge && searchByNumber[number]) {
+            prsByBase[pr.base.ref].imminent[number] = pr;
+        }
+        else {
+            prsByBase[pr.base.ref].latent[number] = pr;
+        }
+    }
+    return prsByBase;
+}
+function joinedPrs(octokit, owner, repo, base) {
+    return __awaiter(this, void 0, void 0, function* () {
+        let prsFromSearch = yield getApprovedPassingPrs(octokit, owner, repo);
+        let prsFromGet = yield getPrs(octokit, owner, repo, base);
+        return combineAndCategorize(prsFromSearch, prsFromGet);
+    });
+}
+function prsToRebaseByBranch(joinedPrs) {
+    let out = {};
+    // If we don't intend to limit rebases, we'll pass through the
+    // imminents unmodified
+    //
+    // TODO: If we limit the number of rebases, should we pick them in
+    // deterministic or random order? If deterministic, what should the
+    // sorting mechanism be?
+    const imminentLimiter = max_mergeable_rebases === 0
+        ? (values) => values
+        : (values) => values.slice(0, max_mergeable_rebases);
+    for (const [branch, { latent, imminent }] of Object.entries(joinedPrs)) {
+        // The PRs categorized as imminent will end up being
+        // auto-merged into their base branch as soon as we rebase
+        // them, so if _any_ PRs are imminent, we start there.
+        //
+        // We rely on the fact that this action should be
+        // retriggered again when that auto-merge occurs and
+        // modifies the base branch.
+        out[branch] = (Object.keys(imminent).length === 0
+            ? Object.values(latent)
+            : imminentLimiter(Object.values(imminent))).map(({ number, title }) => ({ number, title }));
+    }
+    // Note: Even with all this filtering, it's still incomplete. If
+    // we were to fetch the individual pulls rather than the group,
+    // we'd be able to see whether they're rebaseable. Also whether
+    // they're mergeable, although I'm less clear on how that's
+    // defined. (Is it whether we can merge updates from the base
+    // branch into the PR branch or that the PR branch can be merged
+    // into the base branch?)
+    return out;
+}
+function prsToRebase(octokit, owner, repo, base) {
+    return __awaiter(this, void 0, void 0, function* () {
+        let eligiblePrs = yield joinedPrs(octokit, owner, repo, base);
+        return Object.values(prsToRebaseByBranch(eligiblePrs)).flat();
+    });
+}
+function run(octokit, owner, repo, base) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const prs = yield prsToRebase(octokit, owner, repo, base);
+        yield Promise.all(prs.map((pull) => __awaiter(this, void 0, void 0, function* () {
             try {
                 const newSha = yield rebasePullRequest({
                     octokit,
@@ -66,6 +161,10 @@ function run(octokit, owner, repo, base) {
                 console.log(`updated PR "${pull.title}" to new HEAD ${newSha}`);
             }
             catch (error) {
+                // TODO: Again, we can make things fancier. If rebases in
+                // the imminent PR category fail we should proceed to the
+                // next imminent PR. If all the imminent PRs fail to rebase,
+                // we can go ahead with the latent PRs.
                 console.log(error.message);
                 if (error instanceof Error && error.message === "Merge conflict") {
                     console.log(`Could not update "${pull.title}" because of merge conflicts`);
@@ -675,221 +774,6 @@ function toCommandProperties(annotationProperties) {
     };
 }
 exports.toCommandProperties = toCommandProperties;
-//# sourceMappingURL=utils.js.map
-
-/***/ }),
-
-/***/ 4087:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.Context = void 0;
-const fs_1 = __nccwpck_require__(7147);
-const os_1 = __nccwpck_require__(2037);
-class Context {
-    /**
-     * Hydrate the context from the environment
-     */
-    constructor() {
-        var _a, _b, _c;
-        this.payload = {};
-        if (process.env.GITHUB_EVENT_PATH) {
-            if (fs_1.existsSync(process.env.GITHUB_EVENT_PATH)) {
-                this.payload = JSON.parse(fs_1.readFileSync(process.env.GITHUB_EVENT_PATH, { encoding: 'utf8' }));
-            }
-            else {
-                const path = process.env.GITHUB_EVENT_PATH;
-                process.stdout.write(`GITHUB_EVENT_PATH ${path} does not exist${os_1.EOL}`);
-            }
-        }
-        this.eventName = process.env.GITHUB_EVENT_NAME;
-        this.sha = process.env.GITHUB_SHA;
-        this.ref = process.env.GITHUB_REF;
-        this.workflow = process.env.GITHUB_WORKFLOW;
-        this.action = process.env.GITHUB_ACTION;
-        this.actor = process.env.GITHUB_ACTOR;
-        this.job = process.env.GITHUB_JOB;
-        this.runNumber = parseInt(process.env.GITHUB_RUN_NUMBER, 10);
-        this.runId = parseInt(process.env.GITHUB_RUN_ID, 10);
-        this.apiUrl = (_a = process.env.GITHUB_API_URL) !== null && _a !== void 0 ? _a : `https://api.github.com`;
-        this.serverUrl = (_b = process.env.GITHUB_SERVER_URL) !== null && _b !== void 0 ? _b : `https://github.com`;
-        this.graphqlUrl = (_c = process.env.GITHUB_GRAPHQL_URL) !== null && _c !== void 0 ? _c : `https://api.github.com/graphql`;
-    }
-    get issue() {
-        const payload = this.payload;
-        return Object.assign(Object.assign({}, this.repo), { number: (payload.issue || payload.pull_request || payload).number });
-    }
-    get repo() {
-        if (process.env.GITHUB_REPOSITORY) {
-            const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');
-            return { owner, repo };
-        }
-        if (this.payload.repository) {
-            return {
-                owner: this.payload.repository.owner.login,
-                repo: this.payload.repository.name
-            };
-        }
-        throw new Error("context.repo requires a GITHUB_REPOSITORY environment variable like 'owner/repo'");
-    }
-}
-exports.Context = Context;
-//# sourceMappingURL=context.js.map
-
-/***/ }),
-
-/***/ 5438:
-/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
-
-"use strict";
-
-var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
-    if (k2 === undefined) k2 = k;
-    Object.defineProperty(o, k2, { enumerable: true, get: function() { return m[k]; } });
-}) : (function(o, m, k, k2) {
-    if (k2 === undefined) k2 = k;
-    o[k2] = m[k];
-}));
-var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
-    Object.defineProperty(o, "default", { enumerable: true, value: v });
-}) : function(o, v) {
-    o["default"] = v;
-});
-var __importStar = (this && this.__importStar) || function (mod) {
-    if (mod && mod.__esModule) return mod;
-    var result = {};
-    if (mod != null) for (var k in mod) if (k !== "default" && Object.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
-    __setModuleDefault(result, mod);
-    return result;
-};
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.getOctokit = exports.context = void 0;
-const Context = __importStar(__nccwpck_require__(4087));
-const utils_1 = __nccwpck_require__(3030);
-exports.context = new Context.Context();
-/**
- * Returns a hydrated octokit ready to use for GitHub Actions
- *
- * @param     token    the repo PAT or GITHUB_TOKEN
- * @param     options  other options to set
- */
-function getOctokit(token, options) {
-    return new utils_1.GitHub(utils_1.getOctokitOptions(token, options));
-}
-exports.getOctokit = getOctokit;
-//# sourceMappingURL=github.js.map
-
-/***/ }),
-
-/***/ 7914:
-/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
-
-"use strict";
-
-var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
-    if (k2 === undefined) k2 = k;
-    Object.defineProperty(o, k2, { enumerable: true, get: function() { return m[k]; } });
-}) : (function(o, m, k, k2) {
-    if (k2 === undefined) k2 = k;
-    o[k2] = m[k];
-}));
-var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
-    Object.defineProperty(o, "default", { enumerable: true, value: v });
-}) : function(o, v) {
-    o["default"] = v;
-});
-var __importStar = (this && this.__importStar) || function (mod) {
-    if (mod && mod.__esModule) return mod;
-    var result = {};
-    if (mod != null) for (var k in mod) if (k !== "default" && Object.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
-    __setModuleDefault(result, mod);
-    return result;
-};
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.getApiBaseUrl = exports.getProxyAgent = exports.getAuthString = void 0;
-const httpClient = __importStar(__nccwpck_require__(9925));
-function getAuthString(token, options) {
-    if (!token && !options.auth) {
-        throw new Error('Parameter token or opts.auth is required');
-    }
-    else if (token && options.auth) {
-        throw new Error('Parameters token and opts.auth may not both be specified');
-    }
-    return typeof options.auth === 'string' ? options.auth : `token ${token}`;
-}
-exports.getAuthString = getAuthString;
-function getProxyAgent(destinationUrl) {
-    const hc = new httpClient.HttpClient();
-    return hc.getAgent(destinationUrl);
-}
-exports.getProxyAgent = getProxyAgent;
-function getApiBaseUrl() {
-    return process.env['GITHUB_API_URL'] || 'https://api.github.com';
-}
-exports.getApiBaseUrl = getApiBaseUrl;
-//# sourceMappingURL=utils.js.map
-
-/***/ }),
-
-/***/ 3030:
-/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
-
-"use strict";
-
-var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
-    if (k2 === undefined) k2 = k;
-    Object.defineProperty(o, k2, { enumerable: true, get: function() { return m[k]; } });
-}) : (function(o, m, k, k2) {
-    if (k2 === undefined) k2 = k;
-    o[k2] = m[k];
-}));
-var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
-    Object.defineProperty(o, "default", { enumerable: true, value: v });
-}) : function(o, v) {
-    o["default"] = v;
-});
-var __importStar = (this && this.__importStar) || function (mod) {
-    if (mod && mod.__esModule) return mod;
-    var result = {};
-    if (mod != null) for (var k in mod) if (k !== "default" && Object.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
-    __setModuleDefault(result, mod);
-    return result;
-};
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.getOctokitOptions = exports.GitHub = exports.context = void 0;
-const Context = __importStar(__nccwpck_require__(4087));
-const Utils = __importStar(__nccwpck_require__(7914));
-// octokit + plugins
-const core_1 = __nccwpck_require__(6762);
-const plugin_rest_endpoint_methods_1 = __nccwpck_require__(3044);
-const plugin_paginate_rest_1 = __nccwpck_require__(4193);
-exports.context = new Context.Context();
-const baseUrl = Utils.getApiBaseUrl();
-const defaults = {
-    baseUrl,
-    request: {
-        agent: Utils.getProxyAgent(baseUrl)
-    }
-};
-exports.GitHub = core_1.Octokit.plugin(plugin_rest_endpoint_methods_1.restEndpointMethods, plugin_paginate_rest_1.paginateRest).defaults(defaults);
-/**
- * Convience function to correctly format Octokit Options to pass into the constructor.
- *
- * @param     token    the repo PAT or GITHUB_TOKEN
- * @param     options  other options to set
- */
-function getOctokitOptions(token, options) {
-    const opts = Object.assign({}, options || {}); // Shallow clone - don't mutate the object provided by the caller
-    // Auth
-    const auth = Utils.getAuthString(token, opts);
-    if (auth) {
-        opts.auth = auth;
-    }
-    return opts;
-}
-exports.getOctokitOptions = getOctokitOptions;
 //# sourceMappingURL=utils.js.map
 
 /***/ }),
