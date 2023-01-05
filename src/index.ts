@@ -3,8 +3,8 @@ import {
     setFailed,
 } from "@actions/core";
 // Use the following if debugging and comment out the `import` line
-const context = JSON.parse(getInput('context'));
-// import { context } from "@actions/github";
+// const context = JSON.parse(getInput('context'));
+import { context } from "@actions/github";
 import { Octokit } from "@octokit/rest";
 
 const { rebasePullRequest } = require('github-rebase');
@@ -28,8 +28,8 @@ console.log(`Current branch: ${base}`)
 
 try {
     // Use the following if debugging and comment out the `run` line
-    prsToRebase(octokit, owner, repo, base).then(console.log).catch(console.error);
-    // run(octokit, owner, repo, base);
+    // prsToRebase(octokit, owner, repo, base).then(console.log).catch(console.error);
+    run(octokit, owner, repo, base);
 } catch(error: any) {
     setFailed(error.message);
 }
