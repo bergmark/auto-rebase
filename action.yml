@@ -12,7 +12,11 @@ inputs:
     required: false
     default: 'auto-merge'
   max_mergeable_rebases:
-    description: "TODO: copy from Mac"
+    description: >
+      If one more of the PRs have their review approval and no vailed CI
+      checks, how many of such PRs should be rebased. The motivation is
+      that some repos could see an explosion of jobs if this action is
+      capable of re-triggering itself after the rebased PRs are merged.
     required: false
     default: '0'
 runs:
