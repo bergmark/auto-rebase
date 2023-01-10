@@ -17,11 +17,15 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 const core_1 = __nccwpck_require__(2186);
+// Use the following if debugging and comment out the `import` line
+// const context = JSON.parse(getInput('context'));
 const github_1 = __nccwpck_require__(5438);
 const rest_1 = __nccwpck_require__(5375);
 const { rebasePullRequest } = __nccwpck_require__(8152);
 const token = (0, core_1.getInput)('github_token');
 const filter = (0, core_1.getInput)('filter');
+// TODO: better error on failed parse
+const max_mergeable_rebases = parseInt((0, core_1.getInput)('max_mergeable_rebases'));
 if (!['always', 'auto-merge'].includes(filter)) {
     (0, core_1.setFailed)("Illegal filter used");
 }
@@ -33,17 +37,30 @@ console.log(`Owner: ${owner}`);
 console.log(`Repository: ${repo}`);
 console.log(`Current branch: ${base}`);
 try {
+    // Use the following if debugging and comment out the `run` line
+    // prsToRebase(octokit, owner, repo, base).then(console.log).catch(console.error);
     run(octokit, owner, repo, base);
 }
 catch (error) {
     (0, core_1.setFailed)(error.message);
 }
-function run(octokit, owner, repo, base) {
+function searchRequestQuery(owner, repo, base) {
+    return `repo:${owner}/${repo} is:pr is:open -review:changes_requested review:approved status:success draft:false base:${base}`;
+}
+function getApprovedPassingPrs(octokit, owner, repo, base) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const raw_query = searchRequestQuery(owner, repo, base);
+        console.log({ raw_query });
+        const pulls = yield octokit.paginate("GET /search/issues", { q: raw_query });
+        return pulls;
+    });
+}
+function getPrs(octokit, owner, repo, base) {
     return __awaiter(this, void 0, void 0, function* () {
         const pulls = yield octokit.paginate("GET /repos/{owner}/{repo}/pulls", {
-            owner: owner,
-            repo: repo,
-            base: base
+            owner,
+            repo,
+            base,
         }, res => res.data);
         let pullsToRebase;
         if (filter === 'auto-merge') {
@@ -55,26 +72,116 @@ function run(octokit, owner, repo, base) {
         else {
             pullsToRebase = pulls;
         }
-        yield Promise.all(pullsToRebase.map((pull) => __awaiter(this, void 0, void 0, function* () {
-            try {
-                const newSha = yield rebasePullRequest({
-                    octokit,
-                    owner: owner,
-                    pullRequestNumber: pull.number,
-                    repo: repo
-                });
-                console.log(`updated PR "${pull.title}" to new HEAD ${newSha}`);
+        return pullsToRebase;
+    });
+}
+function groupByNumber(prs) {
+    let prsByNumber = {};
+    for (const pr of prs) {
+        let num = pr.number;
+        prsByNumber[num] = pr;
+    }
+    return prsByNumber;
+}
+function combineAndCategorize(prsFromSearch, prsFromGet) {
+    let searchByNumber = groupByNumber(prsFromSearch);
+    let getByNumber = groupByNumber(prsFromGet);
+    let prs = { latent: {}, imminent: {} };
+    for (const [number, pr] of Object.entries(getByNumber)) {
+        if (pr.auto_merge && searchByNumber[number]) {
+            prs.imminent[number] = pr;
+        }
+        else {
+            prs.latent[number] = pr;
+        }
+    }
+    return prs;
+}
+function joinedPrs(octokit, owner, repo, base) {
+    return __awaiter(this, void 0, void 0, function* () {
+        let prsFromSearch = yield getApprovedPassingPrs(octokit, owner, repo, base);
+        let prsFromGet = yield getPrs(octokit, owner, repo, base);
+        return combineAndCategorize(prsFromSearch, prsFromGet);
+    });
+}
+function extract(ary, index) {
+    let value = ary[index];
+    let rest = ary.slice(0, index).concat(ary.slice(index + 1));
+    return { value, rest };
+}
+// Return n random elements of ary
+function select(ary, n) {
+    let values = [];
+    var rest = ary;
+    for (let i = 0; i < n && rest.length > 0; i++) {
+        let randIndex = Math.floor(Math.random() * rest.length);
+        let extraction = extract(rest, randIndex);
+        let value = extraction.value;
+        rest = extraction.rest;
+        values.push(value);
+    }
+    return values;
+}
+function prsToRebase(octokit, owner, repo, base) {
+    return __awaiter(this, void 0, void 0, function* () {
+        let { imminent, latent } = yield joinedPrs(octokit, owner, repo, base);
+        const imminentLimiter = () => {
+            // The PRs categorized as imminent will end up being auto-merged
+            // into their base branch as soon as we rebase them, so if _any_
+            // PRs are imminent, we start there.
+            //
+            // We rely on the fact that this action should be retriggered
+            // again when that auto-merge occurs and modifies the base
+            // branch.
+            //
+            // Again, we could make things fancier. If rebases in the
+            // imminent PR category fail we could proceed to the next
+            // imminent PR. If all the imminent PRs fail to rebase, we can
+            // go ahead with the latent PRs.
+            return Object.keys(imminent).length === 0
+                ? Object.values(latent)
+                : select(Object.values(imminent), max_mergeable_rebases);
+        };
+        // If we don't intend to limit rebases, we'll pass through the
+        // imminents and latents unmodified
+        const prs = (max_mergeable_rebases === 0)
+            ? Object.values(imminent).concat(Object.values(latent))
+            : imminentLimiter();
+        // Well, unmodified aside from reducing them down to only the
+        // necessary fields.
+        return prs.map(({ number, title }) => ({ number, title }));
+    });
+}
+function run(octokit, owner, repo, base) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const prs = yield prsToRebase(octokit, owner, repo, base);
+        yield Promise.all(prs.map((pull) => __awaiter(this, void 0, void 0, function* () { return yield rebasePr(octokit, owner, repo, pull); })));
+    });
+}
+function rebasePr(octokit, owner, repo, pull) {
+    return __awaiter(this, void 0, void 0, function* () {
+        try {
+            const newSha = yield rebasePullRequest({
+                octokit,
+                owner,
+                pullRequestNumber: pull.number,
+                repo
+            });
+            console.log(`updated PR "${pull.title}" to new HEAD ${newSha}`);
+        }
+        catch (error) {
+            // Again, we could make things fancier. If rebases in the
+            // imminent PR category fail we should proceed to the next
+            // imminent PR. If all the imminent PRs fail to rebase, we can
+            // go ahead with the latent PRs.
+            console.log(error.message);
+            if (error instanceof Error && error.message === "Merge conflict") {
+                console.log(`Could not update "${pull.title}" because of merge conflicts`);
             }
-            catch (error) {
-                console.log(error.message);
-                if (error instanceof Error && error.message === "Merge conflict") {
-                    console.log(`Could not update "${pull.title}" because of merge conflicts`);
-                }
-                else {
-                    throw error;
-                }
+            else {
+                throw error;
             }
-        })));
+        }
     });
 }
 
